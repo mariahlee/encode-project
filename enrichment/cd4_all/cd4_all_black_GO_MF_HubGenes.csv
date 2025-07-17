@@ -1,0 +1,2 @@
+"ID","Description","GeneRatio","BgRatio","RichFactor","FoldEnrichment","zScore","pvalue","p.adjust","qvalue","geneID","Count"
+"GO:0030527","structural constituent of chromatin","9/208","73/10643",0.123287671232877,6.3084167544784,6.42519060578459,1.1501568901517e-05,0.00594631112208426,0.00581131902392435,"MACROH2A1/H1-3/H2BC5/H2BC21/H1-2/H4C16/H2BC8/H3C1/H4C5",9

@@ -1,0 +1,501 @@
+---
+title: "Functional Enrichment"
+author: "Mariah Lee"
+date: 'Last Updated: 07.03.2025'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      # Show code in the HTML (set to FALSE to hide code)
+  warning = FALSE,  # Hide warnings in the output
+  message = FALSE,  # Hide messages in the output
+  fig.width = 7,    # Default figure width
+  fig.height = 5,   # Default figure height
+  fig.align = "center" # Center figures
+)
+```
+
+## Overview
+
+This R Markdown document performs functional and pathway enrichment analyses on gene lists identified from Weighted Gene Co-expression Network Analysis (WGCNA) modules. The primary goal is to infer the biological functions of these modules, particularly those significantly associated with specific traits, and to gain insights into the roles of differentially expressed lncRNAs by examining their co-expressed protein-coding partners.
+
+Be sure to change the following parameters for each module/analysis you want to perform enrichment on:
+ - `module_color_of_interest`
+ - `analysis_label` (e.g., "cd4_all", "cd4_naive", "cd4_memory")
+ - Paths to your input .csv and .tsv gene list files
+ - Specific background gene list (ensure it matches the WGCNA analysis it came from)
+
+## Load libraries
+
+```{r libraries}
+# List of required packages for functional enrichment
+cran_packages <- c("readr", "tidyverse", "knitr", "ggplot2")
+bioc_packages <- c("clusterProfiler", "org.Hs.eg.db", "DOSE", "pathview", 
+                   "enrichplot")
+
+# Function to check, install, and load packages
+install_and_load <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE))
+        install.packages("BiocManager")
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+      } else {
+        install.packages(pkg)
+      }
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# Install and load CRAN packages
+for (pkg in cran_packages) {
+  install_and_load(pkg, bioc = FALSE)
+}
+
+# Install and load Bioconductor packages
+for (pkg in bioc_packages) {
+  install_and_load(pkg, bioc = TRUE)
+}
+```
+
+## Define Analysis Parameters and Load Gene Lists
+
+```{r all_genes}
+# Change these for each module/analysis you want to run enrichment on
+module_color_of_interest <- "brown" # e.g., "turquoise", "brown", "pink"
+analysis_label <- "cd4_naive" # e.g., "cd4_all", "cd4_naive", "cd4_memory"
+
+# --- Define Paths to Your Gene List Files ---
+hub_genes_file <- file.path("..", "co-expression", 
+                            paste0("HubGenes_", module_color_of_interest,"_", 
+                                   analysis_label, ".csv"))
+all_genes_in_module_file <- file.path("..", "co-expression", 
+                                      paste0("AllGenesInModule_", module_color_of_interest,
+                                             "_", analysis_label, ".tsv"))
+
+# Load the complete gene-level data from your WGCNA analysis for the background gene list
+gene_level_data_filename <- file.path("..", "co-expression", 
+                                      paste0("gene_level_data_", analysis_label, ".rds"))
+
+if (file.exists(gene_level_data_filename)) {
+  gene_level_data_loaded <- readRDS(gene_level_data_filename)
+  print(paste("Loaded gene-level data from:", gene_level_data_filename))
+} else {
+  stop(paste("ERROR: Gene-level data file not found at", gene_level_data_filename,
+             "Ensure it was saved correctly during WGCNA and the path/label are correct."))
+}
+```
+
+```{r module_genes}
+# Hub Genes
+if (file.exists(hub_genes_file)) {
+  hub_genes_df <- read.csv(hub_genes_file)
+  gene_list_hub <- hub_genes_df$Gene
+  print(paste("Loaded", length(gene_list_hub), "hub genes for module", module_color_of_interest))
+} else {
+  print(paste("Hub genes file not found for", module_color_of_interest, ":", hub_genes_file))
+  gene_list_hub <- character(0) # Empty list
+}
+
+# All Genes in Module
+if (file.exists(all_genes_in_module_file)) {
+  gene_list_all_in_module <- read.table(all_genes_in_module_file, header = FALSE,
+                                        stringsAsFactors = FALSE)$V1
+  print(paste("Loaded", length(gene_list_all_in_module), "total genes for module",
+              module_color_of_interest))
+} else {
+  print(paste("All genes in module file not found for", module_color_of_interest, ":",
+              all_genes_in_module_file))
+  gene_list_all_in_module <- character(0) # Empty list
+}
+
+
+# --- Define Background Genes ---
+# Use all genes that were included in the WGCNA analysis after filtering, from the loaded gene_level_data.
+background_genes <- as.character(gene_level_data_loaded$Gene)
+
+print(paste("Total background genes identified:", length(background_genes)))
+```
+
+## Gene ID Conversion
+
+This step converts the gene lists (hub genes, all genes in module, and background genes) from gene symbols to ENTREZ IDs. This is often necessary as many `clusterProfiler` functions require ENTREZ IDs for proper mapping to biological databases.
+
+```{r convert}
+# Convert gene SYMBOL to ENTREZID for hub genes
+genes_hub_entrez <- bitr(gene_list_hub,
+                         fromType = "SYMBOL",
+                         toType = "ENTREZID",
+                         OrgDb = org.Hs.eg.db,
+                         drop = TRUE) # drop=TRUE removes genes that cannot be mapped
+print(paste("Hub genes mapped to ENTREZID:", nrow(genes_hub_entrez)))
+
+# Convert gene SYMBOL to ENTREZID for all genes in module
+genes_all_in_module_entrez <- bitr(gene_list_all_in_module,
+                                   fromType = "SYMBOL",
+                                   toType = "ENTREZID",
+                                   OrgDb = org.Hs.eg.db,
+                                   drop = TRUE)
+print(paste("All genes in module mapped to ENTREZID:", nrow(genes_all_in_module_entrez)))
+
+# Convert gene SYMBOL to ENTREZID for background genes
+background_genes_entrez <- bitr(background_genes,
+                                fromType = "SYMBOL",
+                                toType = "ENTREZID",
+                                OrgDb = org.Hs.eg.db,
+                                drop = TRUE)
+background_entrez_ids <- background_genes_entrez$ENTREZID
+print(paste("Total background genes mapped to ENTREZID:", length(background_entrez_ids)))
+
+# Critical check: stop if background is empty after mapping
+if (length(background_entrez_ids) == 0) {
+  stop("Background gene list is empty after ENTREZID conversion. Cannot proceed with enrichment.")
+}
+```
+
+## Perform Gene Ontology (GO) Enrichment
+
+```{r go}
+# --- GO Enrichment for Hub Genes ---
+print(paste0("Performing GO enrichment for Hub Genes in ", module_color_of_interest,
+             " module (", analysis_label, ")..."))
+
+# Biological Process (BP)
+ego_hub_bp <- enrichGO(gene          = genes_hub_entrez$ENTREZID,
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = "ENTREZID",
+                       ont           = "BP", # Biological Process
+                       pAdjustMethod = "BH", # Benjamini-Hochberg adjustment
+                       qvalueCutoff  = 0.05,
+                       readable      = TRUE, # Convert ENTREZID back to SYMBOL
+                       universe      = background_entrez_ids)
+
+print("Top GO Biological Processes for Hub Genes:")
+if (!is.null(ego_hub_bp) && inherits(ego_hub_bp, "enrichResult") && nrow(as.data.frame(ego_hub_bp)) > 0) {
+  print(head(as.data.frame(ego_hub_bp)))
+  print(dotplot(ego_hub_bp, showCategory = 10,
+                title = paste0("GO BP for Hub Genes (", module_color_of_interest, " ",
+                               analysis_label, ")")))
+} else {
+  print("No significant GO Biological Process terms found for Hub Genes.")
+}
+
+
+# Molecular Function (MF)
+ego_hub_mf <- enrichGO(gene          = genes_hub_entrez$ENTREZID,
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = "ENTREZID",
+                       ont           = "MF", # Molecular Function
+                       pAdjustMethod = "BH",
+                       qvalueCutoff  = 0.05,
+                       readable      = TRUE,
+                       universe      = background_entrez_ids)
+print("Top GO Molecular Functions for Hub Genes:")
+if (!is.null(ego_hub_mf) && inherits(ego_hub_mf, "enrichResult") && nrow(as.data.frame(ego_hub_mf)) > 0) {
+  print(head(as.data.frame(ego_hub_mf)))
+  print(dotplot(ego_hub_mf, showCategory = 10,
+                title = paste0("GO MF for Hub Genes (", module_color_of_interest, " ",
+                               analysis_label, ")")))
+} else {
+  print("No significant GO Molecular Function terms found for Hub Genes.")
+}
+
+
+# Cellular Component (CC)
+ego_hub_cc <- enrichGO(gene          = genes_hub_entrez$ENTREZID,
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = "ENTREZID",
+                       ont           = "CC", # Cellular Component
+                       pAdjustMethod = "BH",
+                       qvalueCutoff  = 0.05,
+                       readable      = TRUE,
+                       universe      = background_entrez_ids)
+print("Top GO Cellular Components for Hub Genes:")
+if (!is.null(ego_hub_cc) && inherits(ego_hub_cc, "enrichResult") && nrow(as.data.frame(ego_hub_cc)) > 0) {
+  print(head(as.data.frame(ego_hub_cc)))
+  print(dotplot(ego_hub_cc, showCategory = 10,
+                title = paste0("GO CC for Hub Genes (", module_color_of_interest, " ",
+                               analysis_label, ")")))
+} else {
+  print("No significant GO Cellular Component terms found for Hub Genes.")
+}
+
+
+# --- GO Enrichment for All Genes in Module ---
+print(paste0("Performing GO enrichment for All Genes in ", module_color_of_interest, " module (", analysis_label, ")..."))
+
+# Biological Process (BP)
+ego_all_bp <- enrichGO(gene          = genes_all_in_module_entrez$ENTREZID,
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = "ENTREZID",
+                       ont           = "BP", # Biological Process
+                       pAdjustMethod = "BH",
+                       qvalueCutoff  = 0.05,
+                       readable      = TRUE,
+                       universe      = background_entrez_ids)
+print("Top GO Biological Processes for All Genes in Module:")
+if (!is.null(ego_all_bp) && inherits(ego_all_bp, "enrichResult") && nrow(as.data.frame(ego_all_bp)) > 0) {
+  print(head(as.data.frame(ego_all_bp)))
+  print(dotplot(ego_all_bp, showCategory = 10,
+                title = paste0("GO BP for All Genes (", module_color_of_interest, " ",
+                               analysis_label, ")")))
+} else {
+  print("No significant GO Biological Process terms found for All Genes in Module.")
+}
+
+
+# Molecular Function (MF)
+ego_all_mf <- enrichGO(gene          = genes_all_in_module_entrez$ENTREZID,
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = "ENTREZID",
+                       ont           = "MF", # Molecular Function
+                       pAdjustMethod = "BH",
+                       qvalueCutoff  = 0.05,
+                       readable      = TRUE,
+                       universe      = background_entrez_ids)
+print("Top GO Molecular Functions for All Genes in Module:")
+if (!is.null(ego_all_mf) && inherits(ego_all_mf, "enrichResult") && nrow(as.data.frame(ego_all_mf)) > 0) {
+  print(head(as.data.frame(ego_all_mf)))
+  print(dotplot(ego_all_mf, showCategory = 10,
+                title = paste0("GO MF for All Genes (", module_color_of_interest, " ",
+                               analysis_label, ")")))
+} else {
+  print("No significant GO Molecular Function terms found for All Genes in Module.")
+}
+
+
+# Cellular Component (CC)
+ego_all_cc <- enrichGO(gene          = genes_all_in_module_entrez$ENTREZID,
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = "ENTREZID",
+                       ont           = "CC", # Cellular Component
+                       pAdjustMethod = "BH",
+                       qvalueCutoff  = 0.05,
+                       readable      = TRUE,
+                       universe      = background_entrez_ids)
+print("Top GO Cellular Components for All Genes in Module:")
+if (!is.null(ego_all_cc) && inherits(ego_all_cc, "enrichResult") && nrow(as.data.frame(ego_all_cc)) > 0) {
+  print(head(as.data.frame(ego_all_cc)))
+  print(dotplot(ego_all_cc, showCategory = 10,
+                title = paste0("GO CC for All Genes (", module_color_of_interest, " ",
+                               analysis_label, ")")))
+} else {
+  print("No significant GO Cellular Component terms found for All Genes in Module.")
+}
+
+```
+
+## Perform KEGG Pathway Enrichment
+
+```{r pathway}
+# --- KEGG Enrichment for Hub Genes ---
+print(paste0("Performing KEGG enrichment for Hub Genes in ", module_color_of_interest, " module (", analysis_label, ")..."))
+kegg_hub <- enrichKEGG(gene         = genes_hub_entrez$ENTREZID,
+                       organism     = 'hsa', # 'hsa' for Homo sapiens
+                       pvalueCutoff = 0.05,
+                       pAdjustMethod = "BH",
+                       qvalueCutoff = 0.05,
+                       universe     = background_entrez_ids)
+
+print("Top KEGG Pathways for Hub Genes:")
+if (!is.null(kegg_hub) && inherits(kegg_hub, "enrichResult") && nrow(as.data.frame(kegg_hub)) > 0) {
+  print(head(as.data.frame(kegg_hub)))
+  print(dotplot(kegg_hub, showCategory = 10, title = paste0("KEGG Pathways for Hub Genes (", module_color_of_interest, " ", analysis_label, ")")))
+} else {
+  print("No significant KEGG Pathways found for Hub Genes.")
+}
+
+
+# --- KEGG Enrichment for All Genes in Module ---
+print(paste0("Performing KEGG enrichment for All Genes in ", module_color_of_interest, " module (", analysis_label, ")..."))
+kegg_all <- enrichKEGG(gene         = genes_all_in_module_entrez$ENTREZID,
+                       organism     = 'hsa',
+                       pvalueCutoff = 0.05,
+                       pAdjustMethod = "BH",
+                       qvalueCutoff = 0.05,
+                       universe     = background_entrez_ids)
+
+print("Top KEGG Pathways for All Genes in Module:")
+if (!is.null(kegg_all) && inherits(kegg_all, "enrichResult") && nrow(as.data.frame(kegg_all)) > 0) {
+  print(head(as.data.frame(kegg_all)))
+  print(dotplot(kegg_all, showCategory = 10, title = paste0("KEGG Pathways for All Genes (", module_color_of_interest, " ", analysis_label, ")")))
+} else {
+  print("No significant KEGG Pathways found for All Genes in Module.")
+}
+```
+
+### Save the results
+
+```{r save_results}
+# Define a directory to save enrichment results for the current analysis label
+results_dir <- file.path(analysis_label)
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+  print(paste("Created directory:", results_dir))
+}
+
+# Base name for files, incorporating both analysis label and module color
+file_base_name <- paste0(analysis_label, "_", module_color_of_interest)
+
+
+# --- Save GO Enrichment Tables (DataFrames) ---
+if (!is.null(ego_hub_bp) && inherits(ego_hub_bp, "enrichResult") && nrow(as.data.frame(ego_hub_bp)) > 0) {
+  write.csv(as.data.frame(ego_hub_bp),
+            file = file.path(results_dir, paste0(file_base_name, "_GO_BP_HubGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved GO BP Hub Genes table to:", file.path(results_dir, paste0(file_base_name, "_GO_BP_HubGenes.csv"))))
+} else {
+  print(paste("No significant GO BP results for Hub Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+
+if (!is.null(ego_hub_mf) && inherits(ego_hub_mf, "enrichResult") && nrow(as.data.frame(ego_hub_mf)) > 0) {
+  write.csv(as.data.frame(ego_hub_mf),
+            file = file.path(results_dir, paste0(file_base_name, "_GO_MF_HubGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved GO MF Hub Genes table to:", file.path(results_dir, paste0(file_base_name, "_GO_MF_HubGenes.csv"))))
+} else {
+  print(paste("No significant GO MF results for Hub Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+
+if (!is.null(ego_hub_cc) && inherits(ego_hub_cc, "enrichResult") && nrow(as.data.frame(ego_hub_cc)) > 0) {
+  write.csv(as.data.frame(ego_hub_cc),
+            file = file.path(results_dir, paste0(file_base_name, "_GO_CC_HubGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved GO CC Hub Genes table to:", file.path(results_dir, paste0(file_base_name, "_GO_CC_HubGenes.csv"))))
+} else {
+  print(paste("No significant GO CC results for Hub Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+
+if (!is.null(ego_all_bp) && inherits(ego_all_bp, "enrichResult") && nrow(as.data.frame(ego_all_bp)) > 0) {
+  write.csv(as.data.frame(ego_all_bp),
+            file = file.path(results_dir, paste0(file_base_name, "_GO_BP_AllGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved GO BP All Genes table to:", file.path(results_dir, paste0(file_base_name, "_GO_BP_AllGenes.csv"))))
+} else {
+  print(paste("No significant GO BP results for All Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+
+if (!is.null(ego_all_mf) && inherits(ego_all_mf, "enrichResult") && nrow(as.data.frame(ego_all_mf)) > 0) {
+  write.csv(as.data.frame(ego_all_mf),
+            file = file.path(results_dir, paste0(file_base_name, "_GO_MF_AllGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved GO MF All Genes table to:", file.path(results_dir, paste0(file_base_name, "_GO_MF_AllGenes.csv"))))
+} else {
+  print(paste("No significant GO MF results for All Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+
+if (!is.null(ego_all_cc) && inherits(ego_all_cc, "enrichResult") && nrow(as.data.frame(ego_all_cc)) > 0) {
+  write.csv(as.data.frame(ego_all_cc),
+            file = file.path(results_dir, paste0(file_base_name, "_GO_CC_AllGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved GO CC All Genes table to:", file.path(results_dir, paste0(file_base_name, "_GO_CC_AllGenes.csv"))))
+} else {
+  print(paste("No significant GO CC results for All Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+
+# --- Save KEGG Enrichment Tables (DataFrames) ---
+if (!is.null(kegg_hub) && inherits(kegg_hub, "enrichResult") && nrow(as.data.frame(kegg_hub)) > 0) {
+  write.csv(as.data.frame(kegg_hub),
+            file = file.path(results_dir, paste0(file_base_name, "_KEGG_HubGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved KEGG Hub Genes table to:", file.path(results_dir, paste0(file_base_name, "_KEGG_HubGenes.csv"))))
+} else {
+  print(paste("No significant KEGG results for Hub Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+
+if (!is.null(kegg_all) && inherits(kegg_all, "enrichResult") && nrow(as.data.frame(kegg_all)) > 0) {
+  write.csv(as.data.frame(kegg_all),
+            file = file.path(results_dir, paste0(file_base_name, "_KEGG_AllGenes.csv")),
+            row.names = FALSE)
+  print(paste("Saved KEGG All Genes table to:", file.path(results_dir, paste0(file_base_name, "_KEGG_AllGenes.csv"))))
+} else {
+  print(paste("No significant KEGG results for All Genes in module", module_color_of_interest, ". Skipping table save."))
+}
+```
+
+### Save the plots
+
+```{r save_plots}
+# GO Hub BP Plot
+if (exists("ego_hub_bp") && !is.null(ego_hub_bp) && inherits(ego_hub_bp, "enrichResult") && nrow(as.data.frame(ego_hub_bp)) > 0) {
+  p <- dotplot(ego_hub_bp, showCategory = 10, title = paste0("GO BP for Hub Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_GO_BP_HubGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved GO BP Hub Genes plot to:", file.path(results_dir, paste0(file_base_name, "_GO_BP_HubGenes.png"))))
+}
+
+# GO Hub MF Plot
+if (exists("ego_hub_mf") && !is.null(ego_hub_mf) && inherits(ego_hub_mf, "enrichResult") && nrow(as.data.frame(ego_hub_mf)) > 0) {
+  p <- dotplot(ego_hub_mf, showCategory = 10, title = paste0("GO MF for Hub Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_GO_MF_HubGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved GO MF Hub Genes plot to:", file.path(results_dir, paste0(file_base_name, "_GO_MF_HubGenes.png"))))
+}
+
+# GO Hub CC Plot
+if (exists("ego_hub_cc") && !is.null(ego_hub_cc) && inherits(ego_hub_cc, "enrichResult") && nrow(as.data.frame(ego_hub_cc)) > 0) {
+  p <- dotplot(ego_hub_cc, showCategory = 10, title = paste0("GO CC for Hub Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_GO_CC_HubGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved GO CC Hub Genes plot to:", file.path(results_dir, paste0(file_base_name, "_GO_CC_HubGenes.png"))))
+}
+
+# GO All BP Plot
+if (exists("ego_all_bp") && !is.null(ego_all_bp) && inherits(ego_all_bp, "enrichResult") && nrow(as.data.frame(ego_all_bp)) > 0) {
+  p <- dotplot(ego_all_bp, showCategory = 10, title = paste0("GO BP for All Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_GO_BP_AllGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved GO BP All Genes plot to:", file.path(results_dir, paste0(file_base_name, "_GO_BP_AllGenes.png"))))
+}
+
+# GO All MF Plot
+if (exists("ego_all_mf") && !is.null(ego_all_mf) && inherits(ego_all_mf, "enrichResult") && nrow(as.data.frame(ego_all_mf)) > 0) {
+  p <- dotplot(ego_all_mf, showCategory = 10, title = paste0("GO MF for All Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_GO_MF_AllGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved GO MF All Genes plot to:", file.path(results_dir, paste0(file_base_name, "_GO_MF_AllGenes.png"))))
+}
+
+# GO All CC Plot
+if (exists("ego_all_cc") && !is.null(ego_all_cc) && inherits(ego_all_cc, "enrichResult") && nrow(as.data.frame(ego_all_cc)) > 0) {
+  p <- dotplot(ego_all_cc, showCategory = 10, title = paste0("GO CC for All Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_GO_CC_AllGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved GO CC All Genes plot to:", file.path(results_dir, paste0(file_base_name, "_GO_CC_AllGenes.png"))))
+}
+
+# KEGG Hub Plot
+if (exists("kegg_hub") && !is.null(kegg_hub) && inherits(kegg_hub, "enrichResult") && nrow(as.data.frame(kegg_hub)) > 0) {
+  p <- dotplot(kegg_hub, showCategory = 10, title = paste0("KEGG Pathways for Hub Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_KEGG_HubGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved KEGG Hub Genes plot to:", file.path(results_dir, paste0(file_base_name, "_KEGG_HubGenes.png"))))
+}
+
+# KEGG All Plot
+if (exists("kegg_all") && !is.null(kegg_all) && inherits(kegg_all, "enrichResult") && nrow(as.data.frame(kegg_all)) > 0) {
+  p <- dotplot(kegg_all, showCategory = 10, title = paste0("KEGG Pathways for All Genes (", module_color_of_interest, " ", analysis_label, ")"))
+  ggsave(file.path(results_dir, paste0(file_base_name, "_KEGG_AllGenes.png")),
+         plot = p, width = 8, height = 6, units = "in", dpi = 300)
+  print(paste("Saved KEGG All Genes plot to:", file.path(results_dir, paste0(file_base_name, "_KEGG_AllGenes.png"))))
+}
+
+print("Saving of enrichment results complete.")
+```
+
+## Version Control
+
+```{r versions}
+# Get loaded packages and versions
+packages <- sessionInfo()$otherPkgs
+pkg_info <- tibble::tibble(
+  Package = names(packages),
+  Version = sapply(packages, function(pkg) pkg$Version)
+)
+
+# Save to text file
+readr::write_tsv(pkg_info, "package_versions.txt")
+
+print("Saving of software versions complete.")
+```

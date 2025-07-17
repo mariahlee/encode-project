@@ -1,0 +1,2 @@
+"category","subcategory","ID","Description","GeneRatio","BgRatio","RichFactor","FoldEnrichment","zScore","pvalue","p.adjust","qvalue","geneID","Count"
+"Human Diseases","Immune disease","hsa05322","Systemic lupus erythematosus","9/110","85/4863",0.105882352941176,4.68096256684492,5.20796076556943,0.000109366585691491,0.0243887486092024,0.0230245443561033,"9555/81/3017/3113/8349/121504/8339/8350/8367",9
