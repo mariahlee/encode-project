@@ -1,4 +1,4 @@
-# Functional Characterization of Novel lncRNAs in T Cell Activation
+# Functional Characterization of lncRNAs in T Cell Activation
 
 This repository contains the complete bioinformatics pipeline to identify novel long non-coding RNAs (lncRNAs) from human T cell RNA-seq data and to infer their biological function through differential expression, co-expression network analysis, and functional enrichment.
 
