@@ -1,0 +1,589 @@
+---
+title: "Differential Expression in CD4+ T-cells - Activated vs Resting"
+author: "Mariah Lee"
+date: "Last Updated: 02.06.2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      # Show code in the HTML (set to FALSE to hide code)
+  warning = FALSE,  # Hide warnings in the output
+  message = FALSE,  # Hide messages in the output
+  fig.width = 7,    # Default figure width
+  fig.height = 5,   # Default figure height
+  fig.align = "center" # Center figures
+)
+```
+
+## Overview
+
+This document outlines a reproducible workflow for differential expression (DE) analysis comparing activated and resting CD4+ T cells. While the statistical modeling is performed on the whole transcriptome to ensure robust normalization and dispersion estimation, the downstream interpretation and visualization focus specifically on long non-coding RNAs (lncRNAs).
+
+This analysis uses the following Bioconductor packages:
+
+ - `tximport`: To import transcript-level quanitification from Salmon and summarize to the gene level, correcting for potential changes in isoform usage.
+
+ - `DESeq2`: Used for the core differential expression analysis, utilizing a negative binomial generalized linear model to handle biological variability and low counts.
+ 
+ - `biomaRt`: To map Ensembl identifiers to gene symbols and annotate gene biotypes (e.g., distinguishing lncRNAs from protein-coding genes).
+ 
+ - `tidyverse`: For data manipulation and genersting publication-ready visualizations (Volcano plots, Boxplots).
+
+Key steps in this workflow:
+
+1. Import transcript-level quantification data from Salmon.
+2. Annotate genes using Ensembl data.
+3. Quality Control (QC): Assess sample similarity using PCA and check distribution using VST-normalized boxplots.
+4. Filtering: Remove low-count genes to increase statistical power.
+5. Differential Expression: Run the standard DESeq2 pipeline.
+6. Refinement: Apply LFC Shrinkage to remove noise from low-count genes and validate using MA Plots.
+7. Sanity Checks: Verify the analysis by plotting known T-cell activation markers (CD69, IL2RA, etc.).
+8. Visualization: Generate Volcano plots to identify significant lncRNA candidates.
+ 
+## Load libraries
+
+```{r libraries}
+# CRAN packages
+library(tidyverse) # Includes ggplot2, readr, dplyr, etc.
+library(knitr)
+library(ggrepel)
+
+# Bioconductor packages
+library(tximport)
+library(edgeR)
+library(DESeq2)
+library(biomaRt)
+```
+
+## Detect and List All Sample Quantification Files
+
+This code chunk scans the `results/salmon` directory, identifies all sample subfolders (based on their naming pattern), and constructs a named vector of paths to each sample’s quant.sf file. This ensures the analysis will automatically include all current and future samples without manual updates.
+
+```{r samples, echo=FALSE}
+# List all entries in the results/salmon directory
+all_entries <- list.dirs("../results/salmon", full.names = FALSE, recursive = FALSE)
+
+# Filter to keep only sample folders (exclude known non-sample files/folders)
+# You may want to exclude folders like 'deseq2_qc' or any that do not match the sample naming pattern
+sample_folders <- all_entries[grepl("^SRR", all_entries)]
+
+# Construct full paths to quant.sf for each sample
+files <- file.path("../results/salmon", sample_folders, "quant.sf")
+names(files) <- sample_folders
+
+# Check result
+head(files)
+```
+
+## Import Quantification Data and Summarize to Gene Level
+
+This step imports transcript-level quantification files from Salmon for all detected samples, then uses the existing transcript-to-gene mapping file (tx2gene.tsv) to summarize the data at the gene level. The resulting `txi` objects contains estimated counts, abundances, and effective lengths, and serves as the direct input for downstream differential expression analysis.
+
+```{r tximport}
+# Read the transcript-to-gene mapping file
+tx2gene <- readr::read_tsv("../results/salmon/tx2gene.tsv", col_types = "cc")
+
+# Import quantification data and summarize to gene level
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene, countsFromAbundance = "no")
+
+# Inspect the structure of the imported data
+str(txi)
+```
+
+## Extract Gene-Level Counts for Visualization
+
+While DESeq2 operates directly on the `txi` object, we extract the gene-level count matrix her for quality control purposes. This matrix allows for rapid inspection of library sizes and the generation of diagnostic plots, such as bloxplots and MDS, to assess sample quality before statistical testing.
+
+```{r extract}
+# Extract the counts matrix from tximport output
+counts <- txi$counts
+counts[1:5, 1:5]
+```
+
+## Load and Prepare Sample Metadata
+
+This step reads the metadata CSV file into R, sets the sample IDs as row names for easy matching with quantification data, and checks that all samples in the expression matrix have corresponding metadata. This ensures the downstream analyses and visualizations can incorporate sample attributes like treatment, age, and sex.
+
+```{r metadata}
+# Load the metadata CSV file
+metadata <- readr::read_csv("../metadata/sample_metadata.csv")
+
+# Check that all sample names in the counts matrix are present in the metadata
+all(colnames(counts) %in% metadata$SRR_ID)
+# Should return TRUE; if not, check for mismatches or typos
+
+# View the first few rows of the metadata to confirm successful import
+head(metadata)
+```
+
+This chunk processes the metadata to add biologically relevant columns for downstream subsetting and analysis.
+
+```{r edit_metadata}
+# Add Cell_Type by extracting 'CD4' or 'CD8' from Biosample_term_name
+metadata$Cell_Type <- str_extract(metadata$Biosample_term_name, "CD4|CD8")
+
+# Add Cell_State based on keywords in Biosample_term_name
+metadata$Cell_State <- "mature" # Default
+metadata$Cell_State[grepl("naive", metadata$Biosample_term_name, ignore.case = TRUE)] <- "naive"
+metadata$Cell_State[grepl("memory", metadata$Biosample_term_name, ignore.case = TRUE)] <- "memory"
+
+# Rename 'Treatment' to 'Activation_Status' and recode values
+metadata <- metadata %>%
+  mutate(Activation_Status = recode(Treatment,
+                                    "no_treatment" = "resting",
+                                    "treatment" = "activated")) %>%
+  dplyr::select(-Treatment)
+
+# View the updated metadata
+head(metadata)
+```
+
+Here we separate the data into appropriate categories based on cell state.
+
+```{r subset}
+# All CD4+ T cells (Activated vs Resting)
+meta_cd4_all <- metadata %>%
+  filter(Cell_Type == "CD4")
+
+# Naive CD4+ T cells (Activated vs Resting)
+meta_cd4_naive <- metadata %>%
+  filter(Cell_Type == "CD4", Cell_State == "naive")
+
+# Memory CD4+ T cells (Activated vs Resting)
+meta_cd4_memory <- metadata %>%
+  filter(Cell_Type == "CD4", Cell_State == "memory")
+
+
+# Function to subset txi object based on sample IDs
+subset_txi <- function(txi, sample_ids) {
+  txi_subset <- list(
+    counts = txi$counts[, sample_ids, drop=FALSE],
+    abundance = txi$abundance[, sample_ids, drop=FALSE],
+    length = txi$length[, sample_ids, drop=FALSE],
+    countsFromAbundance = txi$countsFromAbundance
+  )
+}
+
+# Subset txi for each comparison
+txi_cd4_all    <- subset_txi(txi, meta_cd4_all$SRR_ID)
+txi_cd4_naive  <- subset_txi(txi, meta_cd4_naive$SRR_ID)
+txi_cd4_memory <- subset_txi(txi, meta_cd4_memory$SRR_ID)
+
+# Save each subset
+saveRDS(txi_cd4_all, "txi_cd4_all.rds")
+saveRDS(meta_cd4_all, "meta_cd4_all.rds")
+
+saveRDS(txi_cd4_naive, "txi_cd4_naive.rds")
+saveRDS(meta_cd4_naive, "meta_cd4_naive.rds")
+
+saveRDS(txi_cd4_memory, "txi_cd4_memory.rds")
+saveRDS(meta_cd4_memory, "meta_cd4_memory.rds")
+```
+
+## Visualizing Gene Expression Data
+
+Before starting differential expression analysis, it’s important to visualize the gene expression data to assess sample quality and relationships. We use Variance Stabilizing Transformation (VST) to normalize counts, which stabilizes variance across the mean, making it ideal for visualization (boxplots/PCA).
+
+### Box Plot of VST-Transformed Counts
+
+This plot shows the distribution of normalized counts. VST makes the data homoscedastic (constant variance), allowing us to fairly compare distributions across samples and identify technical outliers.
+
+```{r boxplot}
+# Create a temporary DESeqDataSet for QC purposes
+dds_qc <- DESeqDataSetFromTximport(txi, colData = metadata, design = ~ 1)
+
+# Perform Variance Stabilizing Transformation (VST)
+vsd <- vst(dds_qc, blind = TRUE)
+
+# Extract the matrix of transformed counts
+vst_mat <- assay(vsd)
+
+# Convert to long format for ggplot2
+vst_long <- as.data.frame(vst_mat) %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "Sample", values_to = "VST_Count")
+
+# Box plot
+p_box <- ggplot(vst_long, aes(x = Sample, y = VST_Count)) +
+  geom_boxplot() +
+  labs(title = "Distribution of VST-Transformed Counts",
+       y = "VST Normalized Counts", x = "Sample") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display and Save
+print(p_box)
+ggsave("VST_Distribution_Boxplot.png", plot = p_box, width = 8, height = 6)
+```
+
+### PCA Plot of Samples
+
+Principal Component Analysis (PCA) visualizes the variance in the dataset. We use the VST-normalized data to ensure that highly expressed genes don't dominate the clustering purely due to magnitude.
+
+```{r pca}
+# Generate PCA Data
+pcaData <- plotPCA(vsd, intgroup = "Activation_Status", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+# Plot using ggplot2
+p_pca <- ggplot(pcaData, aes(PC1, PC2, color = Activation_Status, shape = Cell_Type)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) + 
+  coord_fixed() +
+  ggtitle("PCA of CD4+ T Cell Subsets") +
+  theme_bw()
+
+# Display and Save
+print(p_pca)
+ggsave("PCA_Plot.png", plot = p_pca, width = 8, height = 6)
+```
+
+## Add Gene Names/Symbols to Counts
+
+```{r gene_symbols}
+# Connect to Ensembl Mart
+ensembl <- useEnsembl(biomart = "ensembl", 
+                      dataset = "hsapiens_gene_ensembl", 
+                      host = "https://www.ensembl.org")
+
+# Get gene IDs from your data
+gene_ids_with_versions <- rownames(txi$counts)
+
+# Remove the ".#" version suffix from the Ensembl IDs
+gene_ids <- sub("\\..*", "", gene_ids_with_versions)
+
+gene_annotations <- getBM(
+  attributes = c('ensembl_gene_id', 'hgnc_symbol', 'description', 'gene_biotype'),
+  filters = 'ensembl_gene_id',
+  values = gene_ids,
+  mart = ensembl
+)
+
+# Identify Ensembl IDs that map to more than one unique HGNC symbol
+multi_symbol_mappings <- gene_annotations %>%
+  filter(hgnc_symbol != "") %>% # Only consider entries with an actual symbol
+  group_by(ensembl_gene_id) %>%
+  summarise(
+    num_unique_symbols = n_distinct(hgnc_symbol),
+    symbols = paste(sort(unique(hgnc_symbol)), collapse = "; ") # For inspection
+  ) %>%
+  filter(num_unique_symbols > 1)
+```
+
+## Create a map for gene symbols
+
+```{r create_symbol_map}
+# Add full gene IDs with versions to gene_annotations
+gene_annotations$gene_id_with_version <- gene_ids_with_versions[
+ match(gene_annotations$ensembl_gene_id, gene_ids)
+]
+
+# Create a mapping table: gene_id_with_version -> symbol/biotype
+gene_symbol_map <- gene_annotations %>%
+ dplyr::select(gene_id_with_version, hgnc_symbol, gene_biotype) %>%
+ mutate(symbol_or_id = ifelse(hgnc_symbol == "", gene_id_with_version, hgnc_symbol)) %>%
+ distinct(gene_id_with_version, .keep_all = TRUE)
+```
+
+## Define Long Non-Coding RNA (lncRNA) Subset
+
+Although the statistical analysis is performed on the entire transcriptome to maintain rigorous normalization, we define a specific list of lncRNAs here. This subset will be used to filter and highlight relevant candidates in downstream visualizations and result tables.
+
+```{r lncRNAs}
+# Filter the gene_annotations to identify genes with 'lncRNA' biotype
+lncrna_list <- gene_annotations %>%
+  filter(gene_biotype == "lncRNA")
+
+# Display the first few entries and the dimensions of the lncRNA list
+cat("First few entries of the lncRNA list:\n")
+print(head(lncrna_list))
+cat("\nDimensions of the lncRNA list (rows, columns): ", dim(lncrna_list), "\n")
+```
+
+## Create DESeq2 Objects
+
+```{r objects}
+dds_cd4_all <- DESeqDataSetFromTximport(
+  txi = txi_cd4_all,
+  colData = meta_cd4_all,
+  design = ~ Activation_Status
+)
+
+dds_cd4_naive <- DESeqDataSetFromTximport(
+  txi = txi_cd4_naive,
+  colData = meta_cd4_naive,
+  design = ~ Activation_Status
+)
+
+dds_cd4_memory <- DESeqDataSetFromTximport(
+  txi = txi_cd4_memory,
+  colData = meta_cd4_memory,
+  design = ~ Activation_Status
+)
+```
+
+## Filter Low Counts
+
+Keep gene if it has >= 5 counts in at least 25% of the samples
+
+```{r filter_low_counts}
+filter_dds <- function(dds) {
+  min_count <- 5
+  min_samples <- ceiling(ncol(dds) / 4)
+  
+  keep <- rowSums(counts(dds) >= min_count) >= min_samples
+  return(dds[keep,])
+}
+
+dds_cd4_all_filtered <- filter_dds(dds_cd4_all)
+dds_cd4_naive_filtered <- filter_dds(dds_cd4_naive)
+dds_cd4_memory_filtered <- filter_dds(dds_cd4_memory)
+
+print(paste("Genes remaining in All CD4+ set:", nrow(dds_cd4_all_filtered)))
+```
+
+## Differential Expression Analysis: Activated vs Resting CD4⁺ T Cells
+
+This section performs the core differential expression analysis using the `DESeq2` package. We define a function to run the differential expression pipeline, apply Log Fold Change (LFC) shrinkage to reduce noise in low-count genes, and generate MA plots for quality control.
+
+```{r de_analysis}
+# Function to run DESeq2, Shrinkage, and MA Plot
+run_deseq_analysis <- function(dds_obj, analysis_name) {
+  
+  # Ensure "resting" is the reference level
+  dds_obj$Activation_Status <- factor(dds_obj$Activation_Status, 
+                                      levels = c("resting", "activated"))
+  
+  # Perform differential expression
+  dds <- DESeq(dds_obj)
+  
+  # Extract and Save Normalized Counts
+  # Clean the name for the filename (replace spaces with underscores)
+  clean_name <- gsub(" ", "_", analysis_name)
+  norm_counts <- counts(dds, normalized = TRUE)
+  write.csv(norm_counts, paste0("normalized_counts_", clean_name, ".csv"))
+  
+  # Extract Results
+  res <- results(dds, contrast = c("Activation_Status", "activated", "resting"))
+  
+  # Apply LFC Shrinkage (type="normal" is built-in; use "apeglm" if installed for better accuracy)
+  res_shrunk <- lfcShrink(dds, 
+                          contrast = c("Activation_Status", "activated", "resting"), 
+                          res = res, type = "normal")
+  
+  # Save MA Plot to File
+  png(paste0("MA_Plot_", clean_name, ".png"), width = 800, height = 600)
+  plotMA(res_shrunk, ylim = c(-5, 5), main = paste("MA Plot:", analysis_name))
+  dev.off()
+  
+  # Display MA Plot in Document
+  plotMA(res_shrunk, ylim = c(-5, 5), main = paste("MA Plot:", analysis_name))
+  
+  return(res_shrunk)
+}
+
+# --- Execute Analysis for All Subsets ---
+print("--- Processing All CD4+ ---")
+results_cd4_all <- run_deseq_analysis(dds_cd4_all_filtered, "All CD4+ T Cells")
+
+print("--- Processing Naive ---")
+results_cd4_naive <- run_deseq_analysis(dds_cd4_naive_filtered, "Naive CD4+ T Cells")
+
+print("--- Processing Memory ---")
+results_cd4_memory <- run_deseq_analysis(dds_cd4_memory_filtered, "Memory CD4+ T Cells")
+```
+
+## Identification of Differentially Expressed lncRNAs
+
+After processing, here we save CSVs of the significant lncRNAs that are differentially expressed.
+
+```{r identify_sig_lncrnas}
+# Define function to extract significant lncRNAs
+get_sig_lncrnas <- function(res_obj, symbol_map) {
+  as.data.frame(res_obj) %>%
+    rownames_to_column("gene_id") %>%
+    left_join(symbol_map, by = c("gene_id" = "gene_id_with_version")) %>%
+    filter(padj <= 0.05, abs(log2FoldChange) >= 1) %>%
+    filter(gene_biotype == "lncRNA") %>%
+    arrange(padj)
+}
+
+# Generate lists for each subset
+sig_lncrnas_all    <- get_sig_lncrnas(results_cd4_all, gene_symbol_map)
+sig_lncrnas_naive  <- get_sig_lncrnas(results_cd4_naive, gene_symbol_map)
+sig_lncrnas_memory <- get_sig_lncrnas(results_cd4_memory, gene_symbol_map)
+
+# Save the primary list to a CSV for external review
+write_csv(sig_lncrnas_all, "significant_lncrnas_all_cd4.csv")
+write_csv(sig_lncrnas_naive, "significant_lncrnas_naive_cd4.csv")
+write_csv(sig_lncrnas_memory, "significant_lncrnas_memory_cd4.csv")
+
+# Capture counts for the personal statement
+all_count <- nrow(sig_lncrnas_all)
+
+cat("Total significantly expressed lncRNAs in All CD4+ T-cells:", all_count, "\n")
+```
+
+## Visualization: Volcano Plots
+
+These volcano plots visualize the differential gene expression results for Activated versus Resting CD4+ T cells. Positive LFC values mean the gene is more highly expressed in Activated CD4+ T cells compared to Resting CD4+ T cells. Negative LFC values mean the gene is more highly expressed in Resting CD4+ T cells compared to Activated CD4+ T cells.
+
+```{r volcanos}
+# Function to create Volcano Plot
+plot_volcano <- function(res_obj, symbol_map, title_text) {
+  
+  # Prepare Data
+  plot_data <- as.data.frame(res_obj) %>%
+    rownames_to_column("gene_id") %>%
+    left_join(symbol_map, by = c("gene_id" = "gene_id_with_version"))
+  
+  # Define Thresholds
+  padj_threshold <- 0.05
+  lfc_threshold <- 1
+  
+  # Categorize Significance
+  plot_data <- plot_data %>%
+    mutate(Significance = case_when(
+      padj < padj_threshold & log2FoldChange > lfc_threshold ~ "Upregulated",
+      padj < padj_threshold & log2FoldChange < -lfc_threshold ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    ))
+  
+  plot_data$Significance <- factor(plot_data$Significance, 
+                                   levels = c("Upregulated", "Downregulated", "Not Significant"))
+  
+  # Filter Labels (Significant lncRNAs only)
+  labels_data <- plot_data %>%
+    filter(Significance %in% c("Upregulated", "Downregulated")) %>%
+    filter(gene_biotype == "lncRNA") %>%
+    arrange(padj) %>%
+    slice_head(n = 20)
+  
+  # Plot
+  ggplot(plot_data, aes(x = log2FoldChange, y = -log10(padj))) +
+    geom_point(aes(color = Significance), alpha = 0.8, size = 1) +
+    scale_color_manual(values = c("Upregulated" = "red", 
+                                  "Downregulated" = "blue", 
+                                  "Not Significant" = "grey")) +
+    geom_vline(xintercept = c(-lfc_threshold, lfc_threshold), 
+               linetype = "dashed", color = "darkgreen") +
+    geom_hline(yintercept = -log10(padj_threshold), 
+               linetype = "dashed", color = "darkgreen") +
+    geom_text_repel(data = labels_data, aes(label = symbol_or_id), 
+                    size = 2.5, box.padding = 0.5, max.overlaps = Inf) +
+    labs(title = title_text, x = "Log2 Fold Change (Shrunk)", 
+         y = "-log10(Adjusted p-value)") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+          legend.title = element_blank())
+}
+
+# --- Generate Plots ---
+# Note: fig.height ensures they display large enough in the HTML output
+p1 <- plot_volcano(results_cd4_all, gene_symbol_map, "Activated vs Resting (All CD4+)")
+p2 <- plot_volcano(results_cd4_naive, gene_symbol_map, "Activated vs Resting (Naive)")
+p3 <- plot_volcano(results_cd4_memory, gene_symbol_map, "Activated vs Resting (Memory)")
+
+# Save plots
+ggsave("Volcano_All_CD4.png", p1, width = 7, height = 6)
+ggsave("Volcano_Naive.png", p2, width = 7, height = 6)
+ggsave("Volcano_Memory.png", p3, width = 7, height = 6)
+
+# Display plots
+p1
+p2
+p3
+```
+
+## Sanity Check: Activation Markers & Known LncRNAs
+
+We verify the validity of the analysis by plotting the expression of well-established T-cell activation markers. We expect strong upregulation of early activation markers such as **CD69** and **IL2RA** in the activated condition compared to resting. LncRNAs that are known activation markers are also included.
+
+```{r sanity_check}
+# Function to plot specific markers
+plot_marker_gene <- function(dds_obj, symbol, title_prefix) {
+  
+  # Map Symbol to Ensembl ID
+  target_id <- gene_symbol_map %>% 
+    filter(hgnc_symbol == symbol) %>% 
+    pull(gene_id_with_version)
+  
+  # Plot if found
+  if (length(target_id) > 0 && target_id %in% rownames(dds_obj)) {
+    d <- plotCounts(dds_obj, gene = target_id, intgroup = "Activation_Status", returnData = TRUE)
+    
+    p <- ggplot(d, aes(x = Activation_Status, y = count, fill = Activation_Status)) +
+      geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+      geom_point(position = position_jitter(w = 0.1, h = 0), size = 2) +
+      scale_y_log10() +
+      scale_fill_manual(values = c("activated" = "red", "resting" = "blue")) +
+      labs(title = paste(title_prefix, ":", symbol), y = "Normalized Counts") +
+      theme_bw() +
+      theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+    
+    print(p)
+    ggsave(paste0("SanityCheck_", title_prefix, "_", symbol, ".png"), p, width = 5, height = 4)
+  } else {
+    print(paste("Marker", symbol, "not found (low counts or ID mismatch)."))
+  }
+}
+
+# --- General Markers & LncRNAs (Check in All CD4+) ---
+# CD69/IL2RA = Gold standard activation
+# NEAT1/MALAT1 = Known activation-associated lncRNAs
+general_set <- c("CD69", "IL2RA", "CTLA4", "NEAT1", "MALAT1", "LINC00426", "LINC00152")
+
+print("--- Checking General Markers & LncRNAs ---")
+for (gene in general_set) {
+  plot_marker_gene(dds_cd4_all_filtered, gene, "All_CD4")
+}
+
+# --- Naive-Biased Response (Check in Naive) ---
+# Early immediate genes often spike highest here
+print("--- Checking Naive Response ---")
+for (gene in c("FOS", "JUN")) {
+  plot_marker_gene(dds_cd4_naive_filtered, gene, "Naive")
+}
+
+# --- Effector Response (Check in Memory) ---
+# Memory cells should rapidly produce effector cytokines
+print("--- Checking Memory Effector Response ---")
+for (gene in c("IFNG", "GZMB")) {
+  plot_marker_gene(dds_cd4_memory_filtered, gene, "Memory")
+}
+```
+
+## Saving the Results
+
+```{r save}
+# Function to filter and save significant results
+save_results <- function(res_obj, filename, symbol_map) {
+  df <- as.data.frame(res_obj) %>%
+    rownames_to_column("gene_id") %>%
+    left_join(symbol_map, by = c("gene_id" = "gene_id_with_version")) %>%
+    filter(padj <= 0.05, abs(log2FoldChange) >= 1) %>%
+    arrange(padj)
+  
+  write_tsv(df, filename)
+}
+
+save_results(results_cd4_all, "results_cd4_all_significant.tsv", gene_symbol_map)
+save_results(results_cd4_naive, "results_cd4_naive_significant.tsv", gene_symbol_map)
+save_results(results_cd4_memory, "results_cd4_memory_significant.tsv", gene_symbol_map)
+```
+
+## Version Control
+
+```{r versions}
+# Get loaded packages and versions
+packages <- sessionInfo()$otherPkgs
+pkg_info <- tibble::tibble(
+  Package = names(packages),
+  Version = sapply(packages, function(pkg) pkg$Version)
+)
+
+# Save to text file
+readr::write_tsv(pkg_info, "package_versions.txt")
+```

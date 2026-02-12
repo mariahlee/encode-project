@@ -1,0 +1,615 @@
+---
+title: "Weighted Gene Co-Expression Network Analysis (WGCNA)"
+author: "Mariah Lee"
+date: "Last Updated: 02.10.2026"
+output: html_document
+params:
+  # CHANGE THIS LINE ONLY: "cd4_all", "cd4_naive", or "cd4_memory"
+  analysis: "cd4_all"
+  
+  # Settings Dictionary
+  configs:
+    value:
+      cd4_all:
+        soft_power: 14
+        samples_to_remove: ["SRR22521436", "SRR22521557", "SRR22521556", "SRR22520975", "SRR22520976"]
+        sig_modules: ["turquoise", "darkred", "cyan", "yellow", "black", "brown", "lightyellow", "blue"]
+      
+      cd4_naive:
+        soft_power: 16
+        samples_to_remove: ["SRR22521436", "SRR22521557", "SRR22521556"]
+        sig_modules: ["pink", "brown", "turquoise", "blue", "green"]
+      
+      cd4_memory:
+        soft_power: 18
+        samples_to_remove: []
+        sig_modules: ["blue", "turquoise"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      # Show code in the HTML (set to FALSE to hide code)
+  warning = FALSE,  # Hide warnings in the output
+  message = FALSE,  # Hide messages in the output
+  fig.width = 7,    # Default figure width
+  fig.height = 5,   # Default figure height
+  fig.align = "center" # Center figures
+)
+```
+
+## Overview
+
+This R Markdown document performs **Weighted Gene Co-Expression Network Analysis (WGCNA)** to identify clusters (modules) of highly correlated genes. The primary objective is to infer the biological functions of **long non-coding RNAs (lncRNAs)** by associating them with co-expressed protein-coding genes and specific T-cell activation states.
+
+**Key Features:**
+* **Parameterized Workflow:** Designed to be run dynamically for different cell subsets (All CD4+, Naive, Memory) by changing the `analysis` parameter in the YAML header.
+* **Systems Biology:** Moves beyond differential expression to identify regulatory networks, correlated modules, and "hub" driver genes.
+
+## Load libraries
+
+```{r libraries}
+# Standard Data & Plotting
+library(tidyverse)
+library(knitr)
+library(ggrepel)
+library(gridExtra)
+library(Hmisc)
+
+# Bioconductor / Genomics
+library(tximport)
+library(edgeR)
+library(DESeq2)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Network Analysis
+library(WGCNA)
+
+# Install CorLevelPlot from GitHub
+#devtools::install_github("kevinblighe/CorLevelPlot")
+library(CorLevelPlot) 
+
+allowWGCNAThreads() # Enable multi-threading
+```
+
+```{r setup_config}
+# Get the active analysis name from YAML
+analysis_label <- params$analysis
+
+# Dynamically extract the configuration for that specific analysis
+# This uses the string "cd4_all" (or whatever you set) to grab the right list
+current_config <- params$configs[[analysis_label]]
+
+# Unpack variables for the rest of the script
+soft_power <- current_config$soft_power
+samples_to_be_excluded <- current_config$samples_to_remove
+significant_modules <- current_config$sig_modules
+
+# Handle empty list for samples_to_remove (converts NULL to empty vector)
+if (is.null(samples_to_be_excluded)) samples_to_be_excluded <- character(0)
+
+# Verification Output
+print(paste("Running Analysis:", analysis_label))
+print(paste("Soft Power:", soft_power))
+print("Excluding Samples:"); print(samples_to_be_excluded)
+```
+
+```{r data}
+# Load txi and metadata
+txi_file <- file.path("..", "differential_expression", 
+                      paste0("txi_", analysis_label, ".rds"))
+meta_file <- file.path("..", "differential_expression", 
+                       paste0("meta_", analysis_label, ".rds"))
+
+txi_data <- readRDS(txi_file)
+metadata <- readRDS(meta_file)
+```
+
+## Outlier Detection and Removal
+
+```{r outliers}
+# Get raw counts matrix
+raw_counts <- txi_data$counts
+
+# Check that all sample IDs are in the metadata
+all(colnames(raw_counts) %in% metadata$SRR_ID)
+
+# Detect outlier genes and samples
+gsg <- goodSamplesGenes(t(raw_counts), verbose = 3)
+
+# Report initial findings from goodSamplesGenes
+print(paste("Original number of genes:", nrow(raw_counts)))
+print(paste("Original number of samples:", ncol(raw_counts)))
+
+# Remove genes/samples detected as outliers by goodSamplesGenes
+if (!gsg$allOK) {
+  # Identify specific removals
+  removed_samples <- colnames(raw_counts)[!gsg$goodSamples]
+  removed_genes <- rownames(raw_counts)[!gsg$goodGenes]
+  
+  # Print Sample Info
+  if(length(removed_samples) > 0) {
+    print(paste("Removing", length(removed_samples), "samples flagged by goodSamplesGenes:"))
+    print(removed_samples)
+  } else {
+    print("No samples were flagged for removal by goodSamplesGenes.")
+  }
+  
+  # Print Gene Info
+  if(length(removed_genes) > 0) {
+    print(paste("Removing", length(removed_genes), "genes flagged by goodSamplesGenes."))
+  }
+
+  # Perform removal
+  gsg_counts <- raw_counts[gsg$goodGenes, gsg$goodSamples]
+  
+  # Update metadata
+  metadata <- metadata %>% filter(SRR_ID %in% colnames(gsg_counts))
+  # Re-order metadata to match the new counts columns
+  metadata <- metadata[match(colnames(gsg_counts), metadata$SRR_ID), ]
+
+  print("Data subsetting complete.")
+  
+} else {
+  gsg_counts <- raw_counts # No changes if allOK
+  # Ensure metadata is still in sync
+  metadata <- metadata[match(colnames(gsg_counts), metadata$SRR_ID), ]
+  print("No outliers detected by goodSamplesGenes.")
+}
+```
+
+### Removing Outliers: Hierarchial Clustering
+
+```{r clustering}
+# Detect outlier samples using hierarchical clustering
+htree <- hclust(dist(t(gsg_counts)), method = "average")
+
+# Define filename based on current analysis
+plot_file <- paste0("Sample_Clustering_Tree_", analysis_label, ".png")
+
+# Save Plot
+png(plot_file, width = 12, height = 9, units = "in", res = 300)
+par(cex = 0.6)
+par(mar = c(0, 5, 2, 0))
+plot(htree, main = paste("Sample Clustering:", analysis_label),
+     sub = "", xlab = "", labels = colnames(gsg_counts), hang = -1)
+dev.off()
+
+# Display Plot in Document
+par(cex = 0.6)
+par(mar = c(0, 5, 2, 0))
+plot(htree, main = paste("Sample Clustering:", analysis_label),
+     sub = "", xlab = "", labels = colnames(gsg_counts), hang = -1)
+```
+
+### Removing Outliers: PCA
+
+```{r pca}
+# Detect outlier samples using PCA
+pca <- prcomp(t(gsg_counts), scale. = TRUE) # Added scaling for better normalization
+pca_dat <- as.data.frame(pca$x)
+pca_var <- pca$sdev^2
+pca_var_percent <- round(pca_var / sum(pca_var) * 100, digits = 2)
+
+# Plot PCA
+p_pca <- ggplot(pca_dat, aes(PC1, PC2)) +
+  geom_point(size = 2) +
+  geom_text_repel(aes(label = rownames(pca_dat)), size = 3) +
+  labs(x = paste0('PC1: ', pca_var_percent[1], ' %'),
+       y = paste0('PC2: ', pca_var_percent[2], ' %'),
+       title = paste("PCA Outlier Detection:", analysis_label)) +
+  theme_minimal()
+
+# Save Plot
+ggsave(paste0("PCA_Outlier_Detection_", analysis_label, ".png"), 
+       p_pca, width = 8, height = 6)
+
+# Display Plot
+print(p_pca)
+```
+
+### Removing Outlier Samples
+
+```{r remove_samples}
+# Remove outliers from counts
+# We check if sample is in the exclusion list
+cleaned_counts <- gsg_counts[, !(colnames(gsg_counts) %in% samples_to_be_excluded)]
+
+# Remove outliers from metadata
+metadata_cleaned <- metadata %>%
+  filter(!SRR_ID %in% samples_to_be_excluded)
+
+# Verification
+print(paste("Original samples:", ncol(gsg_counts)))
+print(paste("Final samples:", ncol(cleaned_counts)))
+```
+
+## Filtering Low Counts
+
+We filter out genes with very low expression to reduce noise and computational load. We use a relaxed threshold (25% of samples) to ensure we retain lncRNAs that might be expressed in only one biological condition (e.g. Activated).
+
+```{r filter}
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = round(cleaned_counts),
+  colData = metadata_cleaned,
+  design = ~ 1
+)
+
+# Filter Logic: Match Differential Expression criteria
+# Keep genes with counts >= 5 in at least 25% of samples
+min_count <- 5
+min_samples_threshold <- ceiling(ncol(cleaned_counts) * 0.25)
+
+print(paste("Filtering genes with counts >=", min_count, "in at least", min_samples_threshold, "samples."))
+
+keep <- rowSums(counts(dds) >= min_count) >= min_samples_threshold
+dds_filtered <- dds[keep, ]
+
+print(paste("Number of genes remaining:", nrow(dds_filtered)))
+```
+
+## Normalization (Variance Stabilization)
+
+```{r normalize}
+# Perform VST while blind to experimental groups
+dds_final <- vst(dds_filtered, blind = TRUE)
+
+# Extract and transpose the normalized counts for WGCNA (Samples as rows, Genes as columns)
+norm_counts <- assay(dds_final) %>% 
+  t()
+
+print(paste("Dimensions of normalized matrix:", nrow(norm_counts), 
+            "samples x", ncol(norm_counts), "genes"))
+```
+
+## Soft-Thresholding Power Selection
+
+In this step, we test different power values to find the best setting for constructing the network. The goal is to choose a "soft power" that emphasizes strong correlations (signal) and suppresses weak correlations (noise). We look for the lowest power value where the network structure achieves a "scale-free" fit (indicated by the red line R2>0.8 in the plot).
+
+```{r soft_threshold}
+# Soft-threshold test
+power <- c(c(1:10), seq(from = 12, to = 50, by = 2))
+
+# Pick soft threshold
+sft <- pickSoftThreshold(norm_counts,
+                         powerVector = power,
+                         networkType = "signed", # To distinguish positive and negative correlations
+                         verbose = 5) # verbose = 5 provides detailed output during computation
+
+# Store the results of the soft threshold analysis
+sft_data <- sft$fitIndices
+
+# Scale-free topology fit index
+topo <- ggplot(sft_data, aes(Power, SFT.R.sq, label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  geom_hline(yintercept = 0.9, color = 'red', linetype = 'dashed') + # Target R^2
+  labs(x = 'Soft Threshold Power', y = 'Scale-Free Topology Model Fit, signed R^2') +
+  theme_classic() +
+  ggtitle(paste("Scale-Free Topology:", analysis_label))
+
+# Mean connectivity
+connect <- ggplot(sft_data, aes(Power, mean.k., label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  labs(x = 'Soft Threshold Power', y = 'Mean Connectivity') +
+  theme_classic() +
+  ggtitle(paste("Mean Connectivity:", analysis_label))
+
+# Display and Save
+p_grid <- grid.arrange(topo, connect, nrow = 2)
+ggsave(paste0("Soft_Threshold_Plots_", analysis_label, ".png"), 
+       plot = p_grid, width = 9, height = 7)
+```
+
+## Network Construction and Module Detection
+
+Using the selected soft power, we construct the weighted gene co-expression network. This step calculates the topological overlap matrix (TOM) to measure gene similarity and uses hierarchical clustering to identify "modules" of co-expressed genes.
+
+```{r network}
+# Convert matrix to numeric
+norm_counts[] <- sapply(norm_counts, as.numeric)
+
+# Temporarily store the original 'cor' function to avoid conflicts with WGCNA's 'cor'
+temp_cor <- cor
+cor <- WGCNA::cor
+
+# Build the network and detect modules
+bwnet <- blockwiseModules(norm_counts,
+                          maxBlockSize = ncol(norm_counts), # Set to actual number of genes
+                          TOMType = "signed", # Match networkType from pickSoftThreshold
+                          power = soft_power, # Use the chosen soft threshold power
+                          mergeCutHeight = 0.25, # Merge modules with >75% similarity
+                          numericLabels = FALSE, # Assign color names to modules
+                          randomSeed = 1234, # For reproducibility
+                          verbose = 3) # Provides progress updates
+
+# Restore the original 'cor' function
+cor <- temp_cor
+```
+
+## Module Visualization and Eigengenes
+
+We visualize the gene dendrogram and the corresponding module colors to verify that the clustering algorithm successfully identified distinct modules. We also extract the Module Eigengenes (MEs), which represent the "summary expression profile" of each module.
+
+```{r eigengenes}
+# Extract module eigengenes
+module_eigengenes <- bwnet$MEs
+
+# Print out a preview of the module eigengenes (each column is an eigengene for a module)
+print("Preview of Module Eigengenes:")
+head(module_eigengenes)
+
+# Print Module Counts
+print("Number of genes per module:")
+print(table(bwnet$colors))
+
+# Define Plotting Function (Wrapper to avoid code duplication)
+plot_dendro <- function() {
+  plotDendroAndColors(bwnet$dendrograms[[1]], 
+                      cbind(bwnet$unmergedColors, bwnet$colors),
+                      c("Unmerged", "Merged"), 
+                      dendroLabels = FALSE, 
+                      addGuide = TRUE, 
+                      hang = 0.03,
+                      guideHang = 0.05,
+                      main = paste("Gene Dendrogram:", analysis_label))
+}
+
+# Save to File
+png(paste0("Gene_Dendrogram_", analysis_label, ".png"), width = 12, height = 9, units = "in", res = 300)
+plot_dendro()
+dev.off()
+
+# Display in Document
+plot_dendro()
+
+# The 'grey' module (if present) contains genes that do not strongly co-express with any other module.
+```
+
+## Relate Modules to Traits
+
+We correlate the Module Eigengenes (MEs) with the `Activation_Status` trait to identify which gene modules are significantly associated with T-cell activation.
+
+```{r traits}
+# Ensure 'Activation_Status' is a factor in your cleaned metadata.
+metadata_cleaned$Activation_Status <- factor(metadata_cleaned$Activation_Status,
+                                                     levels = c("resting", "activated"))
+
+# Binarize the 'Activation_Status' categorical variable into numerical columns.
+activation_bin <- binarizeCategoricalColumns(metadata_cleaned$Activation_Status,
+                           includePairwise = FALSE,
+                           includeLevelVsAll = TRUE,
+                           minCount = 1) # Include all levels
+
+# Bind traits to sample IDs
+traits <- data.frame(row.names = rownames(module_eigengenes))
+traits <- cbind(traits, activation_bin)
+
+head(traits)
+```
+
+```{r correlation}
+# Define numbers of samples for correlation calculations
+nSamples <- nrow(norm_counts)
+nGenes <- ncol(norm_counts)
+
+# Correlate module eigengenes and traits
+# 'use = 'p'' specifies Pearson correlation
+module_trait_corr <- cor(module_eigengenes, traits, use = 'p')
+# Calculate the corresponding p-values for the correlations
+module_trait_pvals <- corPvalueStudent(module_trait_corr, nSamples)
+
+print("Module-Trait Correlation Matrix:")
+print(round(module_trait_corr, 2))
+print("Module-Trait Correlation P-values:")
+print(round(module_trait_pvals, 3))
+```
+
+## Visualize Module-Trait Association
+
+```{r heatmap}
+# Merge eigengenes with traits
+heatmap_data <- merge(module_eigengenes, traits, by = 'row.names')
+
+ # Set sample IDs as row names
+rownames(heatmap_data) <- heatmap_data$Row.names
+heatmap_data$Row.names <- NULL
+
+# Plot the heatmap using CorLevelPlot
+corr_heat <- CorLevelPlot(heatmap_data,
+                          x = colnames(activation_bin),
+                          y = colnames(module_eigengenes),
+                          col = c("blue1", "skyblue", "white", "pink", "red"),
+                          main = paste("Module-Trait Relationships:", analysis_label))
+
+# SAVE THE PLOT (Correct method for trellis objects)
+png(paste0("Module_Trait_Heatmap_", analysis_label, ".png"), width = 8, height = 10, units = "in", res = 300)
+print(corr_heat) # You must explicitly print trellis objects
+dev.off()
+
+# Display in Document
+print(corr_heat)
+```
+
+## Map Genes to Modules
+
+We create a dataframe that links every gene to its assigned module color. This mapping is the key to extracting specific gene lists for functional enrichment.
+
+```{r map}
+module_gene_mapping <- as.data.frame(bwnet$colors)
+colnames(module_gene_mapping) <- "ModuleColor"
+module_gene_mapping$Gene <- rownames(module_gene_mapping)
+
+head(module_gene_mapping)
+```
+
+## Intramodular analysis: Identifying driver genes
+
+We calculate module membership (kME) by correlating each gene's expression with the module eigengenes. High kME values indicate "hub genes" that are central drivers of the modules's biological function.
+
+```{r driver_genes}
+# Calculate kME (Gene vs Module Eigengene correlation)
+module_membership <- cor(norm_counts, module_eigengenes, use = 'p')
+module_membership_pvals <- corPvalueStudent(module_membership, nSamples)
+
+print("Preview of Module Membership (kME):")
+print(head(module_membership[, 1:min(5, ncol(module_membership))]))
+print("Preview of Module Membership P-values:")
+print(head(module_membership_pvals[, 1:min(5, ncol(module_membership_pvals))]))
+```
+
+## Calculate Gene Significance (GS)
+
+We calculate the correlation between gene expression and the "Activated" trait. High absolute GS indicates that the gene is strongly upregulated or downregulated during activation.
+
+```{r gene_significance}
+# Define the specific trait column name
+trait_col <- "data.activated.vs.all"
+
+if (trait_col %in% colnames(traits)) {
+  
+  # Calculate Correlation (GS) and P-values
+  gene_signif <- cor(norm_counts, traits[[trait_col]], use = 'p')
+  gene_signif_pvals <- corPvalueStudent(gene_signif, nSamples)
+  
+  # Create Results Dataframe
+  gene_signif_df <- data.frame(Gene = rownames(gene_signif), 
+                               GS_Activation = gene_signif, 
+                               PValue_GS = gene_signif_pvals)
+  
+  # Fix column names (remove the 'data.activated.vs.all' suffix from the merge)
+  colnames(gene_signif_df) <- c("Gene", "GS_Activation", "PValue_GS")
+  
+  # Preview top genes
+  print(head(gene_signif_df %>% arrange(PValue_GS), 20))
+  
+} else {
+  stop(paste("Trait column", trait_col, "not found in traits data."))
+}
+```
+
+## Create Master Dataframe
+
+We compile all network stats (Module Color, kME, p-values, and Gene Significance) into a single master dataframe. This file serves as the primary input for downstream hub gene selection and functional enrichment.
+
+```{r complete_dataframe}
+all_gene_info <- module_gene_mapping
+
+# Format kME table (Module Membership)
+kME_df <- as.data.frame(module_membership)
+# Remove "ME" prefix if present to normalize names (e.g., "MEturquoise" -> "kME_turquoise")
+colnames(kME_df) <- paste0("kME_", gsub("ME", "", colnames(kME_df)))
+kME_df$Gene <- rownames(kME_df)
+
+# Format kME p-value table
+p_kME_df <- as.data.frame(module_membership_pvals)
+colnames(p_kME_df) <- paste0("p.kME_", gsub("ME", "", colnames(p_kME_df)))
+p_kME_df$Gene <- rownames(p_kME_df)
+
+# Merge Module Assignment + kME + Gene Significance
+gene_level_data <- all_gene_info %>%
+  left_join(kME_df, by = "Gene") %>%
+  left_join(p_kME_df, by = "Gene") %>%
+  left_join(gene_signif_df, by = "Gene")
+
+# Save complete dataset
+save_filename <- paste0("gene_level_data_", analysis_label, ".rds")
+saveRDS(gene_level_data, file = save_filename)
+
+print("Preview of Gene Level Data:")
+print(head(gene_level_data[, 1:5])) # Show first 5 cols to verify merge
+```
+
+## Extract Hub Genes
+
+We iterate throught the significant modules (defined in the YAML params) to extract hub genes - those with high module membership (|kME| > 0.7) and significance. We also save the full list of genes in each module for background enrichment analysis.
+
+```{r hub_genes}
+# Use the modules defined in the configuration at the start of the script
+print("Processing the following significant modules:")
+print(significant_modules)
+
+# Define Hub Gene Thresholds
+kme_threshold <- 0.7
+kme_pvalue_threshold <- 0.05
+
+for (module_color in significant_modules) {
+  print(paste("--- Processing Module:", module_color, "---"))
+
+  # 1. Get all genes in the module
+  current_module_genes <- gene_level_data %>%
+    filter(ModuleColor == module_color)
+
+  if (nrow(current_module_genes) == 0) {
+    print(paste("Skipping: No genes found for module", module_color))
+    next
+  }
+
+  print(paste("Total genes in", module_color, "module:",
+              nrow(current_module_genes)))
+
+  # Dynamically select the correct kME and p.kME columns for filtering
+  kme_col <- paste0("kME_", module_color)
+  p_kme_col <- paste0("p.kME_", module_color)
+
+  # Check if the specific kME column exists for this module
+  if (!kme_col %in% colnames(current_module_genes)) {
+    print(paste("Warning: kME column", kme_col, "not found. Cannot filter by kME for this module."))
+    next
+  }
+
+  # Filter for Hub Genes: high kME and low p-value
+  hub_genes <- current_module_genes %>%
+    filter(
+      abs(.data[[kme_col]]) > kme_threshold,
+      .data[[p_kme_col]] < kme_pvalue_threshold
+    ) %>%
+    # Select specific columns to save, including the relevant kME and p-value
+    dplyr::select(Gene, ModuleColor, 
+                  kME = all_of(kme_col), 
+                  PValue_kME = all_of(p_kme_col),
+                  GS_Activation,
+                  PValue_GS) %>%
+    arrange(desc(abs(kME)))
+
+  print(paste("Number of Hub Genes in", module_color, "module:",
+              nrow(hub_genes)))
+
+  # Save Hub Genes (CSV)
+  if (nrow(hub_genes) > 0) {
+    write.csv(hub_genes,
+              file = paste0("HubGenes_", module_color, "_", analysis_label, ".csv"),
+              row.names = FALSE)
+    print(paste("Saved Hub Genes to:", 
+                paste0("HubGenes_", module_color, "_", analysis_label, ".csv")))
+  } else {
+    print(paste("No Hub Genes found for", module_color, "with current thresholds."))
+  }
+
+  # Save a simple list of ALL genes in the module
+  # This list would contain all genes assigned to the module, regardless of kME or GS.
+  # If you want to do enrichment on the entire module first, then this list is what you'd use.
+  write.table(current_module_genes$Gene,
+              file = paste0("AllGenesInModule_", module_color, "_", analysis_label, ".tsv"),
+              row.names = FALSE, col.names = FALSE, quote = FALSE)
+  print(paste("Saved all genes in module to:", 
+              paste0("AllGenesInModule_", module_color, "_", analysis_label, ".tsv")))
+}
+```
+
+## Version Control
+
+```{r versions}
+# Get loaded packages and versions
+packages <- sessionInfo()$otherPkgs
+pkg_info <- tibble::tibble(
+  Package = names(packages),
+  Version = sapply(packages, function(pkg) pkg$Version)
+)
+
+# Save to text file
+readr::write_tsv(pkg_info, "WGCNA_package_versions.txt")
+```
