@@ -1,72 +1,49 @@
-# Functional Characterization of lncRNAs in T Cell Activation
+# Functional Annotation of lncRNAs in Activated CD4+ T-Cells
 
-This repository contains the complete bioinformatics pipeline to identify and characterize the function of **known** long non-coding RNAs (lncRNAs) from public human T cell RNA-seq data. The analysis uses differential expression, co-expression network analysis, and functional enrichment.
+This project identifies and predicts the biological functions of long non-coding RNAs (lncRNAs) during CD4+ T-cell activation using WGCNA co-expression networks and functional enrichment analysis.
 
-The project's primary goal is to generate testable hypotheses about the roles of specific annotated lncRNAs in the human immune response.
+## Workflow Summary
+Preprocessing (Nextflow): Standardized pipeline for alignment and quantification using `nf-core/rnaseq`. \
+Differential Expression: Identification of activation-responsive genes using DESeq2. \
+Co-expression Network Analysis (WGCNA): Grouping genes into modules based on expression patterns. \
+Functional Enrichment: GO (BP, MF, CC) and KEGG pathway analysis on module members. \
+lncRNA Inference: Integration of DE statistics and network position (kME) to assign predicted functions.
 
-***
-
-## Project Workflow
-
-This project is a multi-stage pipeline that uses Nextflow for upstream processing and R for all downstream statistical analysis and functional characterization.
-
-1.  **Upstream RNA-seq Processing**: Raw FASTQ files are processed using the `nf-core/rnaseq` pipeline, which handles QC, alignment (HISAT2), and quantification (Salmon) against a reference annotation. This stage is managed by **Nextflow**.
-2.  **Differential Expression Analysis**: The expression of all annotated genes, including known lncRNAs, is compared between activated and resting T cell samples. This analysis identifies genes that change significantly during the immune response and is performed in **R** using `DESeq2` (v1.48.1).
-3.  **Co-Expression Network Analysis**: To understand gene relationships, a Weighted Gene Co-expression Network Analysis (WGCNA) (v1.73) is performed. This groups genes into functional modules and identifies highly connected "hub" genes that are likely drivers of biological processes.
-4.  **Functional Enrichment Analysis**: The gene modules significantly associated with T cell activation are analyzed to determine their function. Using `clusterProfiler` (v4.16.0), we identify enriched Gene Ontology (GO) terms and KEGG pathways, allowing us to infer the function of co-expressed lncRNAs.
-
-***
-
-## Repository Structure
+## Preprocessing Command
+The raw data was processed using the `nf-core/rnaseq` pipeline (v3.18.0):
 ```
-encode-project/
-│
-├── pipelines/
-│   ├── run_nf-core_rnaseq.sh     # Script to launch Nextflow pipeline
-│   └── Snakefile                 # Snakemake workflow for lncRNA discovery
-│
-├── analysis/
-│   ├── 01_differential_expression.Rmd
-│   ├── 02_co-expression_wgcna.Rmd
-│   └── 03_functional_enrichment.Rmd
-│
-├── data/
-│   ├── samplesheet.csv           # Required input for nf-core/rnaseq
-│   └── metadata.csv              # Metadata for downstream R analysis
-│
-├── human_reference/
-│   ├── GRCh38.p14.genome.fa      # Human reference genome
-│   └── gencode.v48.annotation.gtf  # Human gene annotation
-│
-└── results/
-├── rnaseq/                   # Output from nf-core/rnaseq
-├── lncrna_discovery/         # Output from Snakemake
-└── downstream_analysis/        # Output from R analyses
+nextflow run nf-core/rnaseq -r 3.18.0 \
+    --input samplesheet.csv \
+    --outdir results \
+    --fasta human_reference/GRCh38.p14.genome.fa \
+    --gtf human_reference/gencode.v48.chr_patch_hapl_scaff.annotation.gtf \
+    --aligner hisat2 \
+    --pseudo_aligner salmon \
+    --remove_ribo_rna \
+    -profile singularity \
+    -c custom.config \
+    -resume
 ```
-## System Requirements
+## Repository Contents
+📂 scripts/ \
+DEG_Analysis.Rmd: Differential expression analysis and lncRNA candidate filtering. \
+WGCNA.Rmd: System-level network construction and hub gene identification. \
+functional_enrichment.Rmd: GO/KEGG enrichment analysis for identified modules.
 
-* **Nextflow** (`>=21.10.x`)
-* **Singularity** or **Docker** (container engine for reproducibility)
-* **Conda** / **Mamba** (for managing R environment)
-* **R** (`>=4.1.x`)
+📂 results/ \
+LncRNA_Functional_Annotation_FULL_cd4_naive.csv: Primary output for Naive T-cells. Contains kME scores, DE stats, and inferred functions. \
+LncRNA_Functional_Annotation_FULL_cd4_all.csv: Primary output for Global CD4+ population. \
+Master_Functional_Enrichment_Results.csv: Compiled enrichment data for all modules across all ontologies.
 
-***
+📂 docs/ \
+technical_project_brief.md: Formal project summary and detailed methodology.
 
-## Installation & Setup
+## Key Findings
+Turquoise Module: Strongly enriched for Cell Cycle and DNA Replication. \
+Brown Module: Enriched for T-cell Activation and Calcium Signaling. \
+Blue Module: Associated with Metabolic reprogramming and RNA processing.
 
-1.  **Clone this repository:**
-    ```bash
-    git clone [https://github.com/mariahlee/encode-project.git](https://github.com/mariahlee/encode-project.git)
-    cd encode-project
-    ```
-
-2.  **Prepare the input data:**
-    * Place your reference genome (`.fa`) and annotation (`.gtf`) in the `human_reference/` directory.
-    * Create a `samplesheet.csv` file in the `data/` directory with paths to your raw FASTQ files, following the `nf-core/rnaseq` format.
-    * Create a `metadata.csv` file in the `data/` directory with sample information for the R analyses.
-
-3.  **Run the analysis:**
-    * Execute the `nf-core/rnaseq` pipeline using the script in the `pipelines/` directory.
-    * Once complete, run the R Markdown scripts (`.Rmd`) in the `analysis/` directory sequentially to perform the DE, WGCNA, and enrichment analyses.
-
-***
+## Requirements
+Nextflow & Singularity \
+R >= 4.0 \
+Packages: tidyverse, DESeq2, WGCNA, clusterProfiler, biomaRt
